@@ -46,7 +46,7 @@ use dom::element::Element;
 use dom::event::{Event, EventBubbles, EventCancelable};
 use dom::globalscope::GlobalScope;
 use dom::htmlanchorelement::HTMLAnchorElement;
-use dom::htmliframeelement::HTMLIFrameElement;
+use dom::htmliframeelement::{HTMLIFrameElement, NavigationType};
 use dom::mutationobserver::MutationObserver;
 use dom::node::{Node, NodeDamage, window_from_node};
 use dom::serviceworker::TrustedServiceWorkerAddress;
@@ -87,7 +87,7 @@ use script_runtime::{ScriptPort, StackRootTLS, get_reports, new_rt_and_cx};
 use script_traits::{CompositorEvent, ConstellationControlMsg};
 use script_traits::{DocumentActivity, DiscardBrowsingContext, EventResult};
 use script_traits::{InitialScriptState, LayoutMsg, LoadData, MouseButton, MouseEventType, MozBrowserEvent};
-use script_traits::{NewLayoutInfo, ScriptMsg as ConstellationMsg};
+use script_traits::{NewLayoutInfo, ScriptMsg as ConstellationMsg, UpdatePipelineIdReason};
 use script_traits::{ScriptThreadFactory, TimerEvent, TimerSchedulerMsg, TimerSource};
 use script_traits::{TouchEventType, TouchId, UntrustedNodeAddress, WindowSizeData, WindowSizeType};
 use script_traits::CompositorEvent::{KeyEvent, MouseButtonEvent, MouseMoveEvent, ResizeEvent};
@@ -147,6 +147,8 @@ struct InProgressLoad {
     frame_id: FrameId,
     /// The parent pipeline and frame type associated with this load, if any.
     parent_info: Option<(PipelineId, FrameType)>,
+    /// The creator pipeline if this is an about:blank load.
+    creator_pipeline_id: Option<PipelineId>,
     /// The current window size associated with this pipeline.
     window_size: Option<WindowSizeData>,
     /// Channel to the layout thread associated with this pipeline.
@@ -166,6 +168,7 @@ impl InProgressLoad {
     fn new(id: PipelineId,
            frame_id: FrameId,
            parent_info: Option<(PipelineId, FrameType)>,
+           creator_pipeline_id: Option<PipelineId>,
            layout_chan: Sender<message::Msg>,
            window_size: Option<WindowSizeData>,
            url: ServoUrl,
@@ -174,6 +177,7 @@ impl InProgressLoad {
             pipeline_id: id,
             frame_id: frame_id,
             parent_info: parent_info,
+            creator_pipeline_id: creator_pipeline_id,
             layout_chan: layout_chan,
             window_size: window_size,
             activity: DocumentActivity::FullyActive,
@@ -555,8 +559,8 @@ impl ScriptThreadFactory for ScriptThread {
             let mut failsafe = ScriptMemoryFailsafe::new(&script_thread);
 
             let origin = MutableOrigin::new(load_data.url.origin());
-            let new_load = InProgressLoad::new(id, frame_id, parent_info, layout_chan, window_size,
-                                               load_data.url.clone(), origin);
+            let new_load = InProgressLoad::new(id, frame_id, parent_info, load_data.creator_pipeline_id,
+                                               layout_chan, window_size, load_data.url.clone(), origin);
             script_thread.start_page_load(new_load, load_data);
 
             let reporter_name = format!("script-reporter-{}", id);
@@ -827,7 +831,13 @@ impl ScriptThread {
                 FromConstellation(ConstellationControlMsg::AttachLayout(
                         new_layout_info)) => {
                     self.profile_event(ScriptThreadEventCategory::AttachLayout, || {
-                        let origin = MutableOrigin::new(new_layout_info.load_data.url.origin());
+                        // If this is an about:blank load, it must share the creator's origin.
+                        let origin = new_layout_info.load_data.creator_pipeline_id.and_then(|creator_pipeline_id| {
+                            self.documents.borrow().find_document(creator_pipeline_id).map(|doc| {
+                                doc.origin().clone()
+                            })
+                        }).unwrap_or(MutableOrigin::new(new_layout_info.load_data.url.origin()));
+
                         self.handle_new_layout(new_layout_info, origin);
                     })
                 }
@@ -1043,10 +1053,12 @@ impl ScriptThread {
                                                  event),
             ConstellationControlMsg::UpdatePipelineId(parent_pipeline_id,
                                                       frame_id,
-                                                      new_pipeline_id) =>
+                                                      new_pipeline_id,
+                                                      reason) =>
                 self.handle_update_pipeline_id(parent_pipeline_id,
                                                frame_id,
-                                               new_pipeline_id),
+                                               new_pipeline_id,
+                                               reason),
             ConstellationControlMsg::FocusIFrame(parent_pipeline_id, frame_id) =>
                 self.handle_focus_iframe_msg(parent_pipeline_id, frame_id),
             ConstellationControlMsg::WebDriverScriptCommand(pipeline_id, msg) =>
@@ -1062,8 +1074,6 @@ impl ScriptThread {
                 self.handle_frame_load_event(parent_id, frame_id, child_id),
             ConstellationControlMsg::DispatchStorageEvent(pipeline_id, storage, url, key, old_value, new_value) =>
                 self.handle_storage_event(pipeline_id, storage, url, key, old_value, new_value),
-            ConstellationControlMsg::FramedContentChanged(parent_pipeline_id, frame_id) =>
-                self.handle_framed_content_changed(parent_pipeline_id, frame_id),
             ConstellationControlMsg::ReportCSSError(pipeline_id, filename, line, column, msg) =>
                 self.handle_css_error_reporting(pipeline_id, filename, line, column, msg),
             ConstellationControlMsg::Reload(pipeline_id) =>
@@ -1299,7 +1309,7 @@ impl ScriptThread {
 
         // Kick off the fetch for the new resource.
         let new_load = InProgressLoad::new(new_pipeline_id, frame_id, parent_info,
-                                           layout_chan, window_size,
+                                           load_data.creator_pipeline_id, layout_chan, window_size,
                                            load_data.url.clone(), origin);
         if load_data.url.as_str() == "about:blank" {
             self.start_page_load_about_blank(new_load);
@@ -1399,20 +1409,6 @@ impl ScriptThread {
         }
     }
 
-    fn handle_framed_content_changed(&self,
-                                     parent_pipeline_id: PipelineId,
-                                     frame_id: FrameId) {
-        let doc = self.documents.borrow().find_document(parent_pipeline_id).unwrap();
-        let frame_element = doc.find_iframe(frame_id);
-        if let Some(ref frame_element) = frame_element {
-            frame_element.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
-            let window = doc.window();
-            window.reflow(ReflowGoal::ForDisplay,
-                          ReflowQueryType::NoQuery,
-                          ReflowReason::FramedContentChanged);
-        }
-    }
-
     fn handle_post_message_msg(&self, pipeline_id: PipelineId, origin: Option<ImmutableOrigin>, data: Vec<u8>) {
         match { self.documents.borrow().find_window(pipeline_id) } {
             None => return warn!("postMessage after pipeline {} closed.", pipeline_id),
@@ -1443,10 +1439,11 @@ impl ScriptThread {
     fn handle_update_pipeline_id(&self,
                                  parent_pipeline_id: PipelineId,
                                  frame_id: FrameId,
-                                 new_pipeline_id: PipelineId) {
+                                 new_pipeline_id: PipelineId,
+                                 reason: UpdatePipelineIdReason) {
         let frame_element = self.documents.borrow().find_iframe(parent_pipeline_id, frame_id);
         if let Some(frame_element) = frame_element {
-            frame_element.update_pipeline_id(new_pipeline_id);
+            frame_element.update_pipeline_id(new_pipeline_id, reason);
         }
     }
 
@@ -1761,6 +1758,13 @@ impl ScriptThread {
         ROUTER.route_ipc_receiver_to_mpsc_sender(ipc_timer_event_port,
                                                  self.timer_event_chan.clone());
 
+        // If this is an about:blank load, it must share the creator's origin.
+        let origin = incomplete.creator_pipeline_id.and_then(|creator_pipeline_id| {
+            self.documents.borrow().find_document(creator_pipeline_id).map(|doc| {
+                doc.origin().clone()
+            })
+        }).unwrap_or(incomplete.origin);
+
         // Create the window and document objects.
         let window = Window::new(self.js_runtime.clone(),
                                  MainThreadScriptChan(sender.clone()),
@@ -1784,7 +1788,7 @@ impl ScriptThread {
                                  incomplete.pipeline_id,
                                  incomplete.parent_info,
                                  incomplete.window_size,
-                                 incomplete.origin.clone(),
+                                 origin.clone(),
                                  self.webvr_thread.clone());
 
         // Initialize the browsing context for the window.
@@ -1826,7 +1830,7 @@ impl ScriptThread {
         let document = Document::new(&window,
                                      HasBrowsingContext::Yes,
                                      Some(final_url.clone()),
-                                     incomplete.origin,
+                                     origin,
                                      is_html_document,
                                      content_type,
                                      last_modified,
@@ -2065,7 +2069,7 @@ impl ScriptThread {
             Some(frame_id) => {
                 let iframe = self.documents.borrow().find_iframe(parent_pipeline_id, frame_id);
                 if let Some(iframe) = iframe {
-                    iframe.navigate_or_reload_child_browsing_context(Some(load_data), replace);
+                    iframe.navigate_or_reload_child_browsing_context(Some(load_data), NavigationType::Regular, replace);
                 }
             }
             None => {
